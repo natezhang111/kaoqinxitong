@@ -1,0 +1,350 @@
+﻿from pathlib import Path
+import re
+import time
+
+ROOT = Path.cwd()
+BACKEND = ROOT / "backend"
+APP = BACKEND / "app"
+CONFIG = APP / "core" / "config.py"
+SERVICES = APP / "services"
+ENGINE = SERVICES / "model_liveness_engine.py"
+REQ = BACKEND / "requirements.txt"
+
+ts = time.strftime("%Y%m%d_%H%M%S")
+
+def backup(path: Path):
+    if path.exists():
+        bak = path.with_name(path.name + ".bak_" + ts)
+        bak.write_bytes(path.read_bytes())
+        print(f"Backup: {bak}")
+
+def ensure_requirements():
+    if not REQ.exists():
+        return
+    text = REQ.read_text(encoding="utf-8")
+    add = []
+    for pkg in ["onnxruntime", "opencv-python-headless"]:
+        if not re.search(rf"(?m)^\s*{re.escape(pkg)}(\s|==|>=|<=|$)", text):
+            add.append(pkg)
+    if add:
+        with REQ.open("a", encoding="utf-8") as f:
+            for pkg in add:
+                f.write("\n" + pkg)
+        print("Updated requirements.txt")
+
+def patch_config():
+    if not CONFIG.exists():
+        raise FileNotFoundError(CONFIG)
+
+    backup(CONFIG)
+    text = CONFIG.read_text(encoding="utf-8")
+
+    if "ANTI_SPOOF_ENABLED" not in text:
+        text += "\n\n# Anti-spoofing model config\n"
+
+    settings = {
+        "ANTI_SPOOF_ENABLED": "ANTI_SPOOF_ENABLED = True",
+        "ANTI_SPOOF_MODEL_NAME": 'ANTI_SPOOF_MODEL_NAME = "MiniFASNetV2"',
+        "ANTI_SPOOF_MODEL_PATH": 'ANTI_SPOOF_MODEL_PATH = MODELS_DIR / "anti_spoofing" / "MiniFASNetV2.onnx"',
+        "ANTI_SPOOF_THRESHOLD": "ANTI_SPOOF_THRESHOLD = 0.65",
+        "ANTI_SPOOF_CROP_SCALE": "ANTI_SPOOF_CROP_SCALE = 2.7",
+    }
+
+    for key, line in settings.items():
+        pattern = rf"(?m)^{key}\s*=.*$"
+        if re.search(pattern, text):
+            text = re.sub(pattern, line, text)
+        else:
+            text += line + "\n"
+
+    CONFIG.write_text(text, encoding="utf-8")
+    print("Patched config.py")
+
+def write_engine():
+    backup(ENGINE)
+
+    code = r'''
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict, Iterable, Sequence
+
+import cv2
+import numpy as np
+import onnxruntime as ort
+
+from app.core.config import (
+    ANTI_SPOOF_CROP_SCALE,
+    ANTI_SPOOF_ENABLED,
+    ANTI_SPOOF_MODEL_NAME,
+    ANTI_SPOOF_MODEL_PATH,
+    ANTI_SPOOF_THRESHOLD,
+)
+from app.services.liveness_engine import LivenessEngine
+
+
+class ModelLivenessEngine:
+    def __init__(self) -> None:
+        self.model_path = Path(ANTI_SPOOF_MODEL_PATH)
+        self.threshold = float(ANTI_SPOOF_THRESHOLD)
+        self.crop_scale = float(ANTI_SPOOF_CROP_SCALE)
+        self.heuristic_engine = LivenessEngine()
+
+        self.session = None
+        self.input_name = None
+        self.output_name = None
+        self.input_size = (80, 80)
+
+        self._status: Dict[str, Any] = {
+            "initialized": False,
+            "enabled": bool(ANTI_SPOOF_ENABLED),
+            "mode": f"{ANTI_SPOOF_MODEL_NAME}_onnx",
+            "model_path": str(self.model_path),
+            "threshold": self.threshold,
+            "crop_scale": self.crop_scale,
+            "last_error": None,
+        }
+
+        if ANTI_SPOOF_ENABLED:
+            self._load_model()
+
+    def _load_model(self) -> None:
+        if not self.model_path.exists():
+            self._status["last_error"] = f"Anti-spoofing model not found: {self.model_path}"
+            return
+
+        try:
+            self.session = ort.InferenceSession(
+                str(self.model_path),
+                providers=["CPUExecutionProvider"],
+            )
+            input_cfg = self.session.get_inputs()[0]
+            output_cfg = self.session.get_outputs()[0]
+
+            self.input_name = input_cfg.name
+            self.output_name = output_cfg.name
+
+            shape = input_cfg.shape
+            if len(shape) == 4:
+                h = shape[2] if isinstance(shape[2], int) else 80
+                w = shape[3] if isinstance(shape[3], int) else 80
+                self.input_size = (int(h), int(w))
+
+            self._status["initialized"] = True
+            self._status["input_name"] = self.input_name
+            self._status["output_name"] = self.output_name
+            self._status["input_size"] = self.input_size
+
+        except Exception as exc:
+            self._status["initialized"] = False
+            self._status["last_error"] = str(exc)
+
+    def get_status(self) -> Dict[str, Any]:
+        return dict(self._status)
+
+    @staticmethod
+    def _read_bgr_image(image_path: Path) -> np.ndarray:
+        image_path = Path(image_path)
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image file not found: {image_path}")
+
+        data = np.fromfile(str(image_path), dtype=np.uint8)
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+        if image is None:
+            raise RuntimeError(f"Failed to read image: {image_path}")
+
+        return image
+
+    @staticmethod
+    def _softmax(logits: np.ndarray) -> np.ndarray:
+        logits = np.asarray(logits, dtype=np.float32)
+        if logits.ndim == 1:
+            logits = logits[None, :]
+        logits = logits - np.max(logits, axis=1, keepdims=True)
+        exp = np.exp(logits)
+        return exp / np.sum(exp, axis=1, keepdims=True)
+
+    def _xyxy_to_xywh(self, bbox_xyxy: Sequence[float]) -> list[int]:
+        x1, y1, x2, y2 = [float(v) for v in bbox_xyxy]
+        return [
+            int(x1),
+            int(y1),
+            int(max(x2 - x1, 1.0)),
+            int(max(y2 - y1, 1.0)),
+        ]
+
+    def _crop_face(self, image: np.ndarray, bbox_xywh: Sequence[int]) -> np.ndarray:
+        src_h, src_w = image.shape[:2]
+        x, y, box_w, box_h = [int(v) for v in bbox_xywh]
+
+        box_w = max(box_w, 1)
+        box_h = max(box_h, 1)
+
+        scale = min(
+            (src_h - 1) / box_h,
+            (src_w - 1) / box_w,
+            self.crop_scale,
+        )
+
+        new_w = box_w * scale
+        new_h = box_h * scale
+        center_x = x + box_w / 2.0
+        center_y = y + box_h / 2.0
+
+        x1 = max(0, int(center_x - new_w / 2.0))
+        y1 = max(0, int(center_y - new_h / 2.0))
+        x2 = min(src_w - 1, int(center_x + new_w / 2.0))
+        y2 = min(src_h - 1, int(center_y + new_h / 2.0))
+
+        if x1 >= x2 or y1 >= y2:
+            raise RuntimeError("Invalid anti-spoofing face crop area")
+
+        cropped = image[y1 : y2 + 1, x1 : x2 + 1]
+        return cv2.resize(cropped, self.input_size[::-1])
+
+    def _preprocess(self, image: np.ndarray, bbox_xyxy: Sequence[float]) -> np.ndarray:
+        bbox_xywh = self._xyxy_to_xywh(bbox_xyxy)
+        face = self._crop_face(image, bbox_xywh)
+
+        face = face.astype(np.float32)
+        face = np.transpose(face, (2, 0, 1))
+        face = np.expand_dims(face, axis=0)
+
+        return face
+
+    def predict_frame(self, image_path: Path, bbox: Sequence[float]) -> Dict[str, Any]:
+        if not ANTI_SPOOF_ENABLED:
+            return {
+                "label": "uncertain",
+                "real_score": 0.5,
+                "fake_score": 0.5,
+                "raw_probs": [],
+            }
+
+        if self.session is None or not self._status.get("initialized"):
+            raise RuntimeError(f"Anti-spoofing model is not initialized: {self._status.get('last_error')}")
+
+        image = self._read_bgr_image(Path(image_path))
+        input_tensor = self._preprocess(image, bbox)
+
+        outputs = self.session.run(
+            [self.output_name],
+            {self.input_name: input_tensor},
+        )
+
+        probs = self._softmax(outputs[0])
+        label_idx = int(np.argmax(probs, axis=1)[0])
+
+        # MiniFASNet convention: class index 1 = real face, others = fake.
+        real_idx = 1 if probs.shape[1] > 1 else 0
+
+        real_score = float(probs[0, real_idx])
+        fake_score = float(1.0 - real_score)
+
+        label = "real" if label_idx == real_idx else "fake"
+
+        return {
+            "label": label,
+            "real_score": round(real_score, 6),
+            "fake_score": round(fake_score, 6),
+            "raw_probs": [round(float(x), 6) for x in probs[0].tolist()],
+        }
+
+    def evaluate_sequence(
+        self,
+        image_paths: Sequence[Path],
+        bboxes: Sequence[Sequence[float]],
+    ) -> Dict[str, Any]:
+        if not image_paths or not bboxes or len(image_paths) != len(bboxes):
+            raise ValueError("Invalid liveness frame sequence")
+
+        heuristic = self.heuristic_engine.evaluate_sequence(image_paths, bboxes)
+
+        predictions = [
+            self.predict_frame(Path(image_path), bbox)
+            for image_path, bbox in zip(image_paths, bboxes)
+        ]
+
+        real_scores = [float(item["real_score"]) for item in predictions]
+
+        model_score = float(np.mean(real_scores))
+        heuristic_score = float(heuristic.get("score", 0.0))
+
+        real_frame_count = sum(score >= self.threshold for score in real_scores)
+        real_frame_ratio = real_frame_count / max(len(real_scores), 1)
+
+        final_score = 0.80 * model_score + 0.20 * heuristic_score
+        final_score = float(np.clip(final_score, 0.0, 1.0))
+
+        result = (
+            "real"
+            if final_score >= self.threshold and real_frame_ratio >= 0.60
+            else "fake"
+        )
+
+        confidence = abs(final_score - self.threshold) + 0.5
+        confidence = float(np.clip(confidence, 0.5, 0.99))
+
+        return {
+            "result": result,
+            "score": round(final_score, 6),
+            "confidence": round(confidence, 6),
+            "threshold": self.threshold,
+            "mode": f"{ANTI_SPOOF_MODEL_NAME}_onnx+heuristic",
+            "frame_count": len(image_paths),
+            "model_score": round(model_score, 6),
+            "heuristic_score": round(heuristic_score, 6),
+            "real_frame_count": real_frame_count,
+            "real_frame_ratio": round(real_frame_ratio, 6),
+            "model_predictions": predictions,
+            "heuristic_detail": heuristic,
+        }
+
+    def evaluate(self, image_path: Path, bbox: Iterable[float]) -> Dict[str, Any]:
+        return self.evaluate_sequence([Path(image_path)], [list(bbox)])
+
+
+model_liveness_engine = ModelLivenessEngine()
+'''
+    ENGINE.write_text(code.strip() + "\n", encoding="utf-8")
+    print(f"Wrote {ENGINE}")
+
+def replace_imports():
+    old_pattern = r"from\s+app\.services\.liveness_engine\s+import\s+liveness_engine"
+    new_line = "from app.services.model_liveness_engine import model_liveness_engine as liveness_engine"
+
+    for path in APP.rglob("*.py"):
+        if path == ENGINE:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if re.search(old_pattern, text):
+            backup(path)
+            text = re.sub(old_pattern, new_line, text)
+            path.write_text(text, encoding="utf-8")
+            print(f"Patched import: {path}")
+
+def write_status_test():
+    test_path = BACKEND / "test_antispoof_status.py"
+    code = """import json
+from app.services.model_liveness_engine import model_liveness_engine
+
+status = model_liveness_engine.get_status()
+print(json.dumps(status, ensure_ascii=False, indent=2))
+
+if not status.get("initialized"):
+    raise SystemExit("Anti-spoofing model was not initialized. Check last_error.")
+"""
+    test_path.write_text(code, encoding="utf-8")
+    print(f"Wrote {test_path}")
+
+def main():
+    ensure_requirements()
+    patch_config()
+    write_engine()
+    replace_imports()
+    write_status_test()
+    print("Patch finished.")
+
+if __name__ == "__main__":
+    main()

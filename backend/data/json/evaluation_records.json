@@ -1,0 +1,46 @@
+<<<<<<< HEAD
+[
+  {
+    "activity_id": 4,
+    "actual_student_count": 2,
+    "correct_match_count": 2,
+    "accuracy": 1.0,
+    "created_at": "2026-05-07 15:41:03",
+    "remark": null,
+    "operator_username": "teacher",
+    "id": 1
+  },
+  {
+    "activity_id": 6,
+    "actual_student_count": 11,
+    "correct_match_count": 11,
+    "accuracy": 1.0,
+    "created_at": "2026-05-07 16:30:04",
+    "remark": null,
+    "operator_username": "teacher",
+    "id": 2
+  }
+=======
+[
+  {
+    "activity_id": 4,
+    "actual_student_count": 2,
+    "correct_match_count": 2,
+    "accuracy": 1.0,
+    "created_at": "2026-05-07 15:41:03",
+    "remark": null,
+    "operator_username": "teacher",
+    "id": 1
+  },
+  {
+    "activity_id": 6,
+    "actual_student_count": 11,
+    "correct_match_count": 11,
+    "accuracy": 1.0,
+    "created_at": "2026-05-07 16:30:04",
+    "remark": null,
+    "operator_username": "teacher",
+    "id": 2
+  }
+>>>>>>> 98bf8e49 (update)
+]

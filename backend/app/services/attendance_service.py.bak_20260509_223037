@@ -1,0 +1,474 @@
+from __future__ import annotations
+
+from datetime import datetime, time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
+from uuid import uuid4
+
+from app.core.config import (
+    ALLOWED_IMAGE_SUFFIXES,
+    ATTENDANCE_UPLOAD_DIR,
+    DATETIME_FORMAT,
+    FACE_MATCH_THRESHOLD,
+    FEATURES_DIR,
+    REPORTS_DIR,
+)
+from app.core.exceptions import AppException
+from app.services.emotion_engine import emotion_engine
+from app.services.emotion_service import emotion_service
+from app.services.face_engine import face_engine
+from app.services.liveness_engine import liveness_engine
+from app.storage.excel_exporter import export_attendance_records
+from app.storage.repositories import attendance_repo, students_repo
+
+
+def _parse_date_start(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise AppException(message="开始日期格式应为 YYYY-MM-DD", code=4221, status_code=422)
+
+
+def _parse_date_end(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+        return datetime.combine(parsed, time.max.replace(microsecond=0))
+    except ValueError:
+        raise AppException(message="结束日期格式应为 YYYY-MM-DD", code=4222, status_code=422)
+
+
+class AttendanceService:
+    def now_str(self) -> str:
+        return datetime.now().strftime(DATETIME_FORMAT)
+
+    @staticmethod
+    def normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(record)
+        normalized.setdefault("capture_mode", "manual")
+        normalized.setdefault("threshold", FACE_MATCH_THRESHOLD)
+        normalized.setdefault("liveness_result", "unknown")
+        normalized.setdefault("liveness_score", None)
+        normalized.setdefault("liveness_mode", "unknown")
+        normalized.setdefault("frame_count", 1)
+        normalized.setdefault("valid_frame_count", 1)
+        normalized.setdefault("emotion", None)
+        normalized.setdefault("emotion_score", None)
+        normalized.setdefault("operator_role", None)
+        normalized.setdefault("operator_username", None)
+        return normalized
+
+    def validate_image_filename(self, filename: Optional[str]) -> str:
+        if not filename:
+            raise AppException(message="上传文件缺少文件名", code=4001, status_code=400)
+
+        suffix = Path(filename).suffix.lower()
+        if suffix not in ALLOWED_IMAGE_SUFFIXES:
+            raise AppException(
+                message=f"不支持的图片格式，仅支持: {sorted(ALLOWED_IMAGE_SUFFIXES)}",
+                code=4002,
+                status_code=400,
+            )
+        return suffix
+
+    @staticmethod
+    def attendance_image_relpath(filename: str) -> str:
+        return f"uploads/attendance/{filename}"
+
+    def _save_frame_items(
+        self, frame_items: Sequence[tuple[str, bytes]]
+    ) -> list[tuple[Path, str]]:
+        saved: list[tuple[Path, str]] = []
+        session_id = uuid4().hex
+        validated_items: list[tuple[str, bytes, str]] = []
+        for filename, file_bytes in frame_items:
+            suffix = self.validate_image_filename(filename)
+            validated_items.append((filename, file_bytes, suffix))
+
+        for index, (_, file_bytes, suffix) in enumerate(validated_items, start=1):
+            unique_name = f"attendance_{session_id}_{index:02d}{suffix}"
+            save_path = ATTENDANCE_UPLOAD_DIR / unique_name
+            save_path.write_bytes(file_bytes)
+            saved.append((save_path, self.attendance_image_relpath(unique_name)))
+        return saved
+
+    def load_active_students_with_features(self) -> List[tuple[Dict[str, Any], Path]]:
+        students = students_repo.list_active_students()
+        valid_students: List[tuple[Dict[str, Any], Path]] = []
+
+        for student in students:
+            feature_relpath = student.get("face_feature_path")
+            if not feature_relpath:
+                continue
+
+            feature_path = FEATURES_DIR / Path(str(feature_relpath)).name
+            if not feature_path.exists():
+                continue
+
+            valid_students.append((student, feature_path))
+
+        return valid_students
+
+    def list_records(
+        self,
+        *,
+        current_user: Dict[str, Any],
+        keyword: Optional[str] = None,
+        class_name: Optional[str] = None,
+        status: Optional[str] = None,
+        capture_mode: Optional[str] = None,
+        liveness_result: Optional[str] = None,
+        emotion: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        records = attendance_repo.list_all()
+        result: List[Dict[str, Any]] = []
+        keyword_lower = keyword.strip().lower() if keyword else None
+        dt_start = _parse_date_start(start_date)
+        dt_end = _parse_date_end(end_date)
+
+        for raw_item in records:
+            item = self.normalize_record(raw_item)
+            if current_user.get("role") == "student":
+                student_id = current_user.get("student_id")
+                if student_id is None or item.get("student_id") != student_id:
+                    continue
+
+            if class_name and item.get("class_name") != class_name:
+                continue
+            if status and item.get("status") != status:
+                continue
+            if capture_mode and item.get("capture_mode") != capture_mode:
+                continue
+            if liveness_result and item.get("liveness_result") != liveness_result:
+                continue
+            if emotion and item.get("emotion") != emotion:
+                continue
+
+            if keyword_lower:
+                student_no = str(item.get("student_no", "")).lower()
+                student_name = str(item.get("student_name", "")).lower()
+                if keyword_lower not in student_no and keyword_lower not in student_name:
+                    continue
+
+            created_at = item.get("created_at")
+            if created_at:
+                try:
+                    created_dt = datetime.strptime(created_at, DATETIME_FORMAT)
+                except ValueError:
+                    created_dt = None
+                if created_dt is not None:
+                    if dt_start and created_dt < dt_start:
+                        continue
+                    if dt_end and created_dt > dt_end:
+                        continue
+
+            result.append(item)
+
+        result.sort(key=lambda x: x.get("id", 0), reverse=True)
+        return result
+
+    def get_record(self, record_id: int, current_user: Dict[str, Any]) -> Dict[str, Any]:
+        raw_record = attendance_repo.get_by_id(record_id)
+        record = self.normalize_record(raw_record) if raw_record is not None else None
+        if record is None:
+            raise AppException(message="考勤记录不存在", code=4041, status_code=404)
+
+        if current_user.get("role") == "student":
+            student_id = current_user.get("student_id")
+            if student_id is None or record.get("student_id") != student_id:
+                raise AppException(message="无权查看该考勤记录", code=4033, status_code=403)
+
+        return record
+
+    def export_records(
+        self,
+        *,
+        current_user: Dict[str, Any],
+        keyword: Optional[str] = None,
+        class_name: Optional[str] = None,
+        status: Optional[str] = None,
+        capture_mode: Optional[str] = None,
+        liveness_result: Optional[str] = None,
+        emotion: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Path:
+        records = self.list_records(
+            current_user=current_user,
+            keyword=keyword,
+            class_name=class_name,
+            status=status,
+            capture_mode=capture_mode,
+            liveness_result=liveness_result,
+            emotion=emotion,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        filename = f"attendance_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        output_path = REPORTS_DIR / filename
+        return export_attendance_records(records, output_path)
+
+    @staticmethod
+    def _average_embeddings(embeddings: Sequence[Any]):
+        import numpy as np
+
+        stacked = np.stack(embeddings, axis=0).astype(np.float32)
+        mean_embedding = np.mean(stacked, axis=0)
+        norm = float(np.linalg.norm(mean_embedding))
+        if norm <= 1e-12:
+            raise AppException(message="连续帧特征向量无效", code=5008, status_code=500)
+        return mean_embedding / norm
+
+    def recognize_attendance(
+        self,
+        *,
+        frame_items: Sequence[tuple[str, bytes]],
+        capture_mode: str,
+        current_user: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not frame_items:
+            raise AppException(message="至少需要上传 1 帧图片", code=4003, status_code=400)
+        if capture_mode not in {"manual", "auto"}:
+            raise AppException(message="capture_mode 仅支持 manual 或 auto", code=4223, status_code=422)
+        if any(not item_bytes for _, item_bytes in frame_items):
+            raise AppException(message="上传的图片为空", code=4003, status_code=400)
+
+        saved_frames = self._save_frame_items(frame_items)
+        valid_frames: list[tuple[Path, str, Dict[str, Any]]] = []
+        frame_errors: list[str] = []
+        minimum_valid_frames = 3 if len(saved_frames) >= 3 else 1
+
+        try:
+            for frame_path, frame_relpath in saved_frames:
+                try:
+                    probe_result = face_engine.extract_single_face_embedding(frame_path)
+                    valid_frames.append((frame_path, frame_relpath, probe_result))
+                except Exception as exc:
+                    frame_errors.append(str(exc))
+
+            if len(valid_frames) < minimum_valid_frames:
+                raise AppException(
+                    message="连续抓拍帧中有效单人脸数量不足，请正视镜头并缓慢眨眼或轻微转头后重试",
+                    code=4225,
+                    status_code=422,
+                    data={
+                        "uploaded_frame_count": len(saved_frames),
+                        "valid_frame_count": len(valid_frames),
+                        "frame_errors": frame_errors,
+                    },
+                )
+
+            probe_embedding = self._average_embeddings(
+                [frame_result["embedding"] for _, _, frame_result in valid_frames]
+            )
+            liveness = liveness_engine.evaluate_sequence(
+                [frame_path for frame_path, _, _ in valid_frames],
+                [frame_result["bbox"] for _, _, frame_result in valid_frames],
+            )
+        except Exception:
+            for frame_path, _ in saved_frames:
+                if frame_path.exists():
+                    frame_path.unlink(missing_ok=True)
+            raise
+
+        middle_index = len(valid_frames) // 2
+        primary_frame_path, primary_relpath, primary_probe_result = valid_frames[middle_index]
+        emotion_result = emotion_engine.analyze_face(
+            primary_frame_path,
+            primary_probe_result.get("bbox"),
+        )
+        base_record = {
+            "image_path": primary_relpath,
+            "capture_mode": capture_mode,
+            "threshold": FACE_MATCH_THRESHOLD,
+            "liveness_result": liveness["result"],
+            "liveness_score": liveness["score"],
+            "liveness_mode": liveness["mode"],
+            "frame_count": len(saved_frames),
+            "valid_frame_count": len(valid_frames),
+            "emotion": emotion_result["emotion"],
+            "emotion_score": emotion_result["score"],
+            "created_at": self.now_str(),
+            "operator_role": current_user.get("role"),
+            "operator_username": current_user.get("username"),
+        }
+
+        if liveness["result"] != "real":
+            record = attendance_repo.create(
+                {
+                    **base_record,
+                    "student_id": None,
+                    "student_no": None,
+                    "student_name": None,
+                    "class_name": None,
+                    "match_score": 0.0,
+                    "status": "rejected",
+                    "note": "活体检测未通过，已拒绝本次考勤",
+                }
+            )
+            emotion_service.record_attendance_emotion(
+                attendance_record_id=record["id"],
+                student_id=None,
+                student_no=None,
+                student_name=None,
+                class_name=None,
+                emotion=emotion_result["emotion"],
+                emotion_score=emotion_result["score"],
+                emotion_mode=emotion_result["mode"],
+                image_path=primary_relpath,
+                created_at=record["created_at"],
+                operator_username=current_user.get("username"),
+            )
+            return {
+                "matched": False,
+                "student_id": None,
+                "student_no": None,
+                "student_name": None,
+                "class_name": None,
+                "image_path": primary_relpath,
+                "capture_mode": capture_mode,
+                "match_score": 0.0,
+                "threshold": FACE_MATCH_THRESHOLD,
+                "status": "rejected",
+                "record_id": record["id"],
+                "bbox": primary_probe_result["bbox"],
+                "det_score": primary_probe_result["det_score"],
+                "liveness_result": liveness["result"],
+                "liveness_score": liveness["score"],
+                "liveness_threshold": liveness["threshold"],
+                "liveness_mode": liveness["mode"],
+                "frame_count": len(saved_frames),
+                "valid_frame_count": len(valid_frames),
+                "emotion": emotion_result["emotion"],
+                "emotion_score": emotion_result["score"],
+            }
+
+        candidates = self.load_active_students_with_features()
+        if not candidates:
+            raise AppException(
+                message="当前没有可用的人脸特征库，请先为学生上传并提取人脸特征",
+                code=4004,
+                status_code=400,
+            )
+
+        best_student = None
+        best_score = -1.0
+        for student, feature_path in candidates:
+            try:
+                gallery_embedding = face_engine.load_embedding(feature_path)
+                score = face_engine.cosine_similarity(probe_embedding, gallery_embedding)
+            except Exception:
+                continue
+
+            if score > best_score:
+                best_score = score
+                best_student = student
+
+        best_score = round(float(max(best_score, 0.0)), 6)
+
+        if best_student is not None and best_score >= FACE_MATCH_THRESHOLD:
+            record = attendance_repo.create(
+                {
+                    **base_record,
+                    "student_id": best_student["id"],
+                    "student_no": best_student.get("student_no"),
+                    "student_name": best_student.get("name"),
+                    "class_name": best_student.get("class_name"),
+                    "match_score": best_score,
+                    "status": "present",
+                    "note": "人脸识别成功",
+                }
+            )
+            emotion_service.record_attendance_emotion(
+                attendance_record_id=record["id"],
+                student_id=best_student["id"],
+                student_no=best_student.get("student_no"),
+                student_name=best_student.get("name"),
+                class_name=best_student.get("class_name"),
+                emotion=emotion_result["emotion"],
+                emotion_score=emotion_result["score"],
+                emotion_mode=emotion_result["mode"],
+                image_path=primary_relpath,
+                created_at=record["created_at"],
+                operator_username=current_user.get("username"),
+            )
+            return {
+                "matched": True,
+                "student_id": best_student["id"],
+                "student_no": best_student.get("student_no"),
+                "student_name": best_student.get("name"),
+                "class_name": best_student.get("class_name"),
+                "image_path": primary_relpath,
+                "capture_mode": capture_mode,
+                "match_score": best_score,
+                "threshold": FACE_MATCH_THRESHOLD,
+                "status": "present",
+                "record_id": record["id"],
+                "bbox": primary_probe_result["bbox"],
+                "det_score": primary_probe_result["det_score"],
+                "liveness_result": liveness["result"],
+                "liveness_score": liveness["score"],
+                "liveness_threshold": liveness["threshold"],
+                "liveness_mode": liveness["mode"],
+                "frame_count": len(saved_frames),
+                "valid_frame_count": len(valid_frames),
+                "emotion": emotion_result["emotion"],
+                "emotion_score": emotion_result["score"],
+            }
+
+        record = attendance_repo.create(
+            {
+                **base_record,
+                "student_id": None,
+                "student_no": None,
+                "student_name": None,
+                "class_name": None,
+                "match_score": best_score,
+                "status": "unknown",
+                "note": "未匹配到已知学生",
+            }
+        )
+        emotion_service.record_attendance_emotion(
+            attendance_record_id=record["id"],
+            student_id=None,
+            student_no=None,
+            student_name=None,
+            class_name=None,
+            emotion=emotion_result["emotion"],
+            emotion_score=emotion_result["score"],
+            emotion_mode=emotion_result["mode"],
+            image_path=primary_relpath,
+            created_at=record["created_at"],
+            operator_username=current_user.get("username"),
+        )
+        return {
+            "matched": False,
+            "student_id": None,
+            "student_no": None,
+            "student_name": None,
+            "class_name": None,
+            "image_path": primary_relpath,
+            "capture_mode": capture_mode,
+            "match_score": best_score,
+            "threshold": FACE_MATCH_THRESHOLD,
+            "status": "unknown",
+            "record_id": record["id"],
+            "bbox": primary_probe_result["bbox"],
+            "det_score": primary_probe_result["det_score"],
+            "liveness_result": liveness["result"],
+            "liveness_score": liveness["score"],
+            "liveness_threshold": liveness["threshold"],
+            "liveness_mode": liveness["mode"],
+            "frame_count": len(saved_frames),
+            "valid_frame_count": len(valid_frames),
+            "emotion": emotion_result["emotion"],
+            "emotion_score": emotion_result["score"],
+        }
+
+
+attendance_service = AttendanceService()

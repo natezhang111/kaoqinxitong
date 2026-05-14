@@ -1,0 +1,114 @@
+<<<<<<< HEAD
+from __future__ import annotations
+
+from datetime import datetime
+
+=======
+from __future__ import annotations
+
+from datetime import datetime
+
+>>>>>>> 98bf8e49 (update)
+from fastapi import APIRouter
+
+from app.core.config import APP_NAME, APP_VERSION, MODEL_STATUS
+from app.services.emotion_engine import emotion_engine
+from app.services.face_engine import face_engine
+<<<<<<< HEAD
+from app.services.model_liveness_engine import model_liveness_engine as liveness_engine
+from app.storage.repositories import attendance_repo, students_repo, users_repo
+from app.utils.response import success_response
+
+router = APIRouter(prefix="/system", tags=["system"])
+
+
+@router.get("/health")
+async def health_check():
+    return success_response(
+        data={
+            "app_name": APP_NAME,
+            "version": APP_VERSION,
+            "status": "ok",
+            "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+
+
+@router.get("/model-status")
+=======
+from app.services.liveness_engine import liveness_engine
+from app.storage.repositories import attendance_repo, students_repo, users_repo
+from app.utils.response import success_response
+
+router = APIRouter(prefix="/system", tags=["system"])
+
+
+@router.get("/health")
+async def health_check():
+    return success_response(
+        data={
+            "app_name": APP_NAME,
+            "version": APP_VERSION,
+            "status": "ok",
+            "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+
+
+@router.get("/model-status")
+>>>>>>> 98bf8e49 (update)
+async def model_status():
+    models = dict(MODEL_STATUS)
+    face_status = face_engine.get_status()
+    liveness_status = liveness_engine.get_status()
+    emotion_status = emotion_engine.get_status()
+    models["face_recognition"] = (
+        "ready" if face_status.get("initialized") else "not_initialized"
+    )
+    models["liveness_detection"] = (
+        "ready" if liveness_status.get("initialized") else "not_initialized"
+    )
+    models["emotion_recognition"] = (
+        "ready" if emotion_status.get("initialized") else "not_initialized"
+    )
+
+    return success_response(
+        data={
+<<<<<<< HEAD
+            "device": face_status.get("device") or "unknown",
+=======
+            "device": face_status.get("device")
+            or emotion_status.get("device")
+            or "unknown",
+>>>>>>> 98bf8e49 (update)
+            "models": models,
+            "face_engine": face_status,
+            "liveness_engine": liveness_status,
+            "emotion_engine": emotion_status,
+        }
+    )
+<<<<<<< HEAD
+
+
+@router.get("/summary")
+async def system_summary():
+    return success_response(
+        data={
+            "user_count": len(users_repo.list_all()),
+            "student_count": len(students_repo.list_all()),
+            "attendance_count": len(attendance_repo.list_all()),
+        }
+    )
+=======
+
+
+@router.get("/summary")
+async def system_summary():
+    return success_response(
+        data={
+            "user_count": len(users_repo.list_all()),
+            "student_count": len(students_repo.list_all()),
+            "attendance_count": len(attendance_repo.list_all()),
+        }
+    )
+>>>>>>> 98bf8e49 (update)

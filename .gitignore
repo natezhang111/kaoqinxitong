@@ -1,0 +1,55 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Conda / venv
+.venv/
+venv/
+env/
+envs/
+*.egg-info/
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs / cache
+*.log
+logs/
+.cache/
+tmp/
+temp/
+
+# Database local files
+*.db
+*.sqlite
+*.sqlite3
+
+# Large model files
+*.pth
+*.pt
+*.onnx
+*.h5
+*.pkl
+backend/models/**/*.pth
+backend/models/**/*.pt
+backend/models/**/*.onnx
+backend/models/**/*.h5
+backend/models/**/*.pkl
+backend/models/emotion/*.pth
+
+# Upload/runtime files if too large
+backend/uploads/
+backend/static/uploads/

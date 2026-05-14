@@ -1,0 +1,4 @@
+student_no,name,class_name,is_active
+20240001,张三,软件工程1班,true
+20240002,李四,软件工程1班,true
+20240003,王五,软件工程2班,false
